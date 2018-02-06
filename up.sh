@@ -13,12 +13,15 @@ source ./state/env.sh
 : ${OPSMAN_FQDN:?"!"}
 : ${OPSMAN_USERNAME:?"!"}
 : ${OPSMAN_PASSWORD:?"!"}
+: ${CONCOURSE_URL:?"!"}
 PAS_PRODUCT_NAME=p-windows-runtime
 PAS_VERSION=2.0.1
 PAS_GLOB="p-windows-runtime-*.pivotal"
 PAS_STEMCELL_PRODUCT_NAME=stemcells-windows-server-internal
 PAS_STEMCELL_GLOB='bosh-stemcell-*-vsphere-esxi-windows2012R2-go_agent.tgz' 
 PAS_STEMCELL_VERSION=3445.19
+PAS_MAJOR_MINOR_VERSION='2\.[0-9\]+\.[0-9]+$'
+PCF_PIPELINES_VERSION=v0.23.0
 
 set -x
 
@@ -30,209 +33,91 @@ if ! [ -f bin/pivnet ]; then
   chmod +x bin/pivnet
 fi
 
-if grep "Please login" <(bin/pivnet products); then
-  bin/pivnet login --api-token=$PIVNET_API_TOKEN
+if ! [ -f bin/yaml-patch ]; then
+  curl -L "https://github.com/krishicks/yaml-patch/releases/download/v0.0.10/yaml_patch_linux" > bin/yaml-patch
+  chmod +x bin/yaml-patch
 fi
 
-if ! [ -f bin/om ]; then
-  curl -L "https://github.com/pivotal-cf/om/releases/download/0.29.0/om-linux" > bin/om
-  chmod +x bin/om
+if ! [ -f bin/fly ]; then
+  curl -L "$CONCOURSE_URL/api/v1/cli?arch=amd64&platform=linux" > bin/fly
+  chmod +x bin/fly
 fi
 
-if ! [ -f bin/pas.pivotal ]; then
+bin/pivnet login --api-token=$PIVNET_API_TOKEN
+
+if ! [ -d bin/pcf-pipelines ]; then
   bin/pivnet \
     download-product-files \
-    --product-slug=$PAS_PRODUCT_NAME \
-    --release-version=$PAS_VERSION \
-    --glob=$PAS_GLOB \
+    --product-slug=pcf-automation \
+    --release-version=$PCF_PIPELINES_VERSION \
+    --glob=pcf-pipelines-*.tgz \
     --download-dir=bin/ \
     --accept-eula \
   ;
 
-  mv bin/$PAS_GLOB bin/pas.pivotal
+  tar -xf bin/pcf-pipelines-*.tgz -C bin/
+  rm bin/pcf-pipelines-*.tgz
 fi
 
-if ! grep -q $PAS_PRODUCT_NAME <(bin/om -t https://$OPSMAN_FQDN -k -u $OPSMAN_USERNAME -p $OPSMAN_PASSWORD available-products); then
-  bin/om \
-    --target https://$OPSMAN_FQDN \
-    --username $OPSMAN_USERNAME \
-    --password $OPSMAN_PASSWORD \
-    --skip-ssl-validation \
-    upload-product \
-      --product bin/pas.pivotal \
-  ;
-fi
+IAAS_TYPE=openstack
+cat > state/upgrade-tile-params.yml <<EOF
+# Resource
+# ------------------------------
+# The token used to download the product file from Pivotal Network. Find this
+# on your Pivotal Network profile page:
+# https://network.pivotal.io/users/dashboard/edit-profile
+pivnet_token: $PIVNET_API_TOKEN
+# The minor product version to track, as a regexp. To track 1.11.x of a product, this would be "^1\.11\..*$", as shown below.
+product_version_regex: $PAS_MAJOR_MINOR_VERSION
 
-if ! [ -f bin/$PAS_STEMCELL_GLOB ]; then
-  bin/pivnet \
-    download-product-files \
-    --product-slug=stemcells \
-    --release-version=$PAS_STEMCELL_VERSION \
-    --glob=$PAS_STEMCELL_GLOB \
-    --download-dir=bin/ \
-    --accept-eula \
-  ;
-fi
+# Operations Manager
+# ------------------------------
+# Credentials for Operations Manager. These are used for uploading, staging,
+# and deploying the product file on Operations Manager.
+# Either opsman_client_id/opsman_client_secret or opsman_admin_username/opsman_admin_password needs to be specified. 
+# If you are using opsman_admin_username/opsman_admin_password, edit opsman_client_id/opsman_client_secret to be an empty value.
+# If you are using opsman_client_id/opsman_client_secret, edit opsman_admin_username/opsman_admin_password to be an empty value. 
+opsman_client_id:
+opsman_client_secret:
+opsman_admin_username: $OPSMAN_USERNAME
+opsman_admin_password: $OPSMAN_PASSWORD
+opsman_domain_or_ip_address: $OPSMAN_FQDN
 
-bin/om \
-  --target https://10.0.0.3 \
-  --skip-ssl-validation \
-  --username admin \
-  --password password \
-  upload-stemcell \
-    --stemcell bin/$PAS_STEMCELL_GLOB \
-;
+# The IaaS name for which stemcell to download. This must match the IaaS name
+# within the stemcell to download, e.g. "vsphere", "aws", "azure", "google" must be lowercase.
+iaas_type: $IAAS_TYPE
 
-if ! grep -q $PAS_PRODUCT_NAME <(bin/om -t https://$OPSMAN_FQDN -k -u $OPSMAN_USERNAME -p $OPSMAN_PASSWORD deployed-products); then
-  bin/om \
-    --target https://$OPSMAN_FQDN \
-    --username $OPSMAN_USERNAME \
-    --password $OPSMAN_PASSWORD \
-    --skip-ssl-validation \
-    stage-product \
-      --product-name $PAS_PRODUCT_NAME \
-      --product-version $PAS_VERSION \
-  ;
+# om-linux
+# ------------------------------
+# The name of the product on Pivotal Network. This is used to configure the
+# resource that will fetch the product file.
+#
+# This can be found in the URL of the product page, e.g. for rabbitmq the URL
+# is https://network.pivotal.io/products/pivotal-rabbitmq-service, and the
+# product slug is 'pivotal-rabbitmq-service'.
+product_slug: $PAS_PRODUCT_NAME
+# The globs regular expression for the PivNet resource to download the product
+# release files. "*pivotal" is the default.
+# For products such as ERT, it is recommended to use "cf*pivotal" to avoid the
+# extra download of the SRT file in PCF 1.12.*
+product_globs: $PAS_GLOB
 
-  bin/om \
-    --target https://$OPSMAN_FQDN \
-    --skip-ssl-validation \
-    --username $OPSMAN_USERNAME \
-    --password $OPSMAN_PASSWORD \
-    configure-product \
-      --product-name $PAS_PRODUCT_NAME \
-      --product-properties '{
-       ".cloud_controller.system_domain": {
-         "value": "pcf.young.io"
-       },
-       ".cloud_controller.apps_domain": {
-         "value": "pcf.young.io"
-       },
-       ".properties.networking_point_of_entry": {
-         "value": "haproxy"
-       },
-       ".properties.networking_point_of_entry.haproxy.ssl_ciphers": {
-         "value": "DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384"
-       },
-       ".properties.networking_point_of_entry.haproxy.ssl_rsa_certificate": {
-         "value": {
-           "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIDdDCCAlygAwIBAgIVAIXx6vMQHDSKGTYDxMBMOKNR5hfsMA0GCSqGSIb3DQEB\nCwUAMB8xCzAJBgNVBAYTAlVTMRAwDgYDVQQKDAdQaXZvdGFsMB4XDTE4MDExNjEz\nNTExN1oXDTIwMDExNjEzNTExN1owODELMAkGA1UEBhMCVVMxEDAOBgNVBAoMB1Bp\ndm90YWwxFzAVBgNVBAMMDioucGNmLnlvdW5nLmlvMIIBIjANBgkqhkiG9w0BAQEF\nAAOCAQ8AMIIBCgKCAQEAy2XWSjI8I+8NkPybm/s20sJ3feb+bl3/siyvBT/fwOQm\nGFWBLR7eK1rK45bayG9HOyd6dw9a4Y0FCnZjyGpJ0vGNUmF84FCMJaFbr9Kbz2UX\ndgdi6uOiMJJFE3JZHx7uPLlGKVH3ZwYeymSqT19SeduPJrWOXWe8ldWiiaNoPGvz\nVHTsRp9rGTJPdmXl9UWIcZjj8RcPnR6RoarwFt0fm8h+MOrmJi8Ljv2x53oh39Fg\n3szhjWctYiv50CL614PbUiTkx/H9lcdTIIFdbAOBzOwtsKeF4VTDd7pCeKozaQ4G\ndiUzMCSpyUJ+knCjcYV97mgAD3pjmrBZk1RNeCMYXwIDAQABo4GNMIGKMA4GA1Ud\nDwEB/wQEAwIHgDAdBgNVHQ4EFgQULb08ze+CGiVNOs37dAEd2m3oVAkwHQYDVR0l\nBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFEKpP+q/yBOjmUbm\nYAbm57SBLveAMBkGA1UdEQQSMBCCDioucGNmLnlvdW5nLmlvMA0GCSqGSIb3DQEB\nCwUAA4IBAQCRWH7TFEPvYN92WXnHb3jFRxdaXRlTJpn+/qn0l/9HS3a5PKviRPN6\nxcCRy/AJpJhrUR9hUgAWjpR7prIN/XF9RqkiQq0bSv35K4WX2cnjvABN4TlbRQ1E\nYJucR+kbum9qvbdvYa7PISPYhO8wqSbo/X3CdH5u7bm3r02gzc8PpCiH6wYsT8oK\n7GUmITWCl5aok0wtng4DtlEchCtfOOsivpJTAvCkX9k7QlrGf2fBWcdBGeRY0IDN\nGM8caJLaGGRt8kaTP9iTXoDSWk64vmAXM+RvKKQPdknQ8IQWs7GrMmStQRs1LK7W\nDpRDoa/9rzMKILzdbehgrvutk0Xh6AD5\n-----END CERTIFICATE-----",
-           "private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAy2XWSjI8I+8NkPybm/s20sJ3feb+bl3/siyvBT/fwOQmGFWB\nLR7eK1rK45bayG9HOyd6dw9a4Y0FCnZjyGpJ0vGNUmF84FCMJaFbr9Kbz2UXdgdi\n6uOiMJJFE3JZHx7uPLlGKVH3ZwYeymSqT19SeduPJrWOXWe8ldWiiaNoPGvzVHTs\nRp9rGTJPdmXl9UWIcZjj8RcPnR6RoarwFt0fm8h+MOrmJi8Ljv2x53oh39Fg3szh\njWctYiv50CL614PbUiTkx/H9lcdTIIFdbAOBzOwtsKeF4VTDd7pCeKozaQ4GdiUz\nMCSpyUJ+knCjcYV97mgAD3pjmrBZk1RNeCMYXwIDAQABAoIBAF5Z6jLW5MEChneI\nRqLvwLm5zfZQbhxCbHd5dOLpg2EWNHm7SEXm+MaBwnYap3is7g0Jvix2qgDRCtKU\noqr4azB4LsdVQ7lGhAx8smx4NSDa0yxENuWhHL6NS4++zoq6LWdrxpkqVaqr0yKt\n2bciD79JUzlwpQ69LWUQCerxK0xDL4Vx/S2eHF+CjXLsloSbbNWJWHMQKiThxBT5\n1Gg1mDU4O9LqmbwRC5pJwxsNrZbcTax+5AlsTHCnvKx37bN9ltgdzc5+SJgITttD\nzIDFVCiORQ8sIoCyM5FfiYDHlSEF+yjlWy2Ckrwsky40qAqGJkDYZrIf7SUxYAZP\nNhXqNUECgYEA6Xxp54zDkBhfeurEcN68ot7yuhGP6XMnUg8pbTF+FYU6+YatzbBJ\ndqeaXu9IdWEqn69Nz8nbb4wsUf0mfyjPuUnLHhXPYjldwidwVERZ5nchKwCd4q8O\nRVhUr/rSWFebD21c/N44IjrADIXddXOWy7Kj+jowk/wo81nZL4KRUWECgYEA3wKy\nyesrHs1UxYb09D126AG8A/45kzzjV4gU7BReGedkitg2Z2qhtF6W4720hNHma2vv\nmaOLSbjlHEpJZ85N6zLyKL6ubuE5xVqOiFRAf87/gByDL4nYcp+aKTiFy8mrYfQ0\nrfjRQKfnbKljUoLlFOIFHobgkwW4m8ZgF2gmAb8CgYEAs9bnf7lVnHSZfoS7wDBf\n3ZeaICWM0oSm4bbZ8sgvVIYlUbMhxg+l1iXsankmN3sbKJoPdiAFzBqMvK4fa8xU\ni2RCdi7YaNDE3dog1Fc9Y52Yx5WXBtZNSK5rtIyeXftEbRKQkBjd5ceYy0yEsoXQ\nvZ8gXIlbh3CvXhlzhvur0KECgYEAhobsL14LnwMiNh3ZOlSxm/cf4hDDzowWYEEY\nzejjcyDgx9jxyKTMcy/0OeHAObcdFoP//2Bmr8w3eT9e1J3g5xbOecG9G+oFnYWp\nIZghaHgILNIGWPEAfvTEXEVagLphBi/4b1H/eM9QjX4JCkcnxdcqW2Xlpwr2eBHM\n+ZG8C6UCgYBHj3QW0d/SlHRlBP+pbF22rj7M3oNEjkLFXtYun1k7yG4qX0q2YZpB\nZAOoLmOQ/UxPiOeNAhXb3UsbKwtdPvy77F5OTPUMTf+AwET1kB6vsdXf9ZxXFoxN\nWFQXMTAJz3dpgKcoFMsOZEOVWAkXi5kpOoLQnBAV3X3T766KNEf64w==\n-----END RSA PRIVATE KEY-----"
-         }
-       },
-       ".uaa.service_provider_key_credentials": {
-         "value": {
-           "cert_pem": "-----BEGIN CERTIFICATE-----\nMIIDcTCCAlmgAwIBAgIUfOL0tPiyHdKhoGvrvobyPQmPdjkwDQYJKoZIhvcNAQEL\nBQAwHzELMAkGA1UEBhMCVVMxEDAOBgNVBAoMB1Bpdm90YWwwHhcNMTgwMTExMjEx\nMDI5WhcNMjAwMTExMjExMDI5WjA3MQswCQYDVQQGEwJVUzEQMA4GA1UECgwHUGl2\nb3RhbDEWMBQGA1UEAwwNKi5jZi55b3VuZy5pbzCCASIwDQYJKoZIhvcNAQEBBQAD\nggEPADCCAQoCggEBAKju8svxrLS8JMDk5iD7qShFWwMTL0Fv4GttzsdfERgeMslD\nCl0R0s9LhXbBQDf+6T6cY9OS1D3qCmIeJKAfvvKUA0HYO/WOhYgeA5la3JcR8Cec\nee5TTLcWZtaQxskVL1N3CVBnU8gzonkFG0qPec+ZjJDYMcsfMaPpUlynxBOMty9n\nwFcK1sWkAxNdupPsILOHmMlZE914oHAwuCHFJJdZX8KA5JrNVu6y15CttOh2719b\nxjP/rjq96YbCSU2lMUyloif3B1OpZV6YV7oRl7tXa9+duTlAfm/UMCF5Wk5C2NK5\nJL0L0mhS77Z6O6vNnltYgPFMmMUIfsSGRbODmP8CAwEAAaOBjDCBiTAOBgNVHQ8B\nAf8EBAMCB4AwHQYDVR0OBBYEFEKlPpdsa/mp4uhFarG3ajORdmHwMB0GA1UdJQQW\nMBQGCCsGAQUFBwMCBggrBgEFBQcDATAfBgNVHSMEGDAWgBQWiuFm5ce353jXotUt\nDRIJvzbdkTAYBgNVHREEETAPgg0qLmNmLnlvdW5nLmlvMA0GCSqGSIb3DQEBCwUA\nA4IBAQB4+xOfEiuA+jmKCCi6tFJbX6I7KSwjrSEW7W8Tgn/qNfTc6fY95HT66d/g\nB3MJuaHKhRPirOwU0MUjzLRvYwRrV3y6yg/1DY231Tjh+7/UBlQMK1yZzkmh4sid\nc5HIKw8zizMmVwmSFAG/FDzl42LSIjI1GPkAxO4nZnS3pX0Lfu93iO9X894IdjrR\nj3m5BW1rTdZXX4gk26M/55kgMkW5m9LgjwF5Z2OK/ZFkozanvVgoOvQnoWdUM2A6\nJvIKnE7PE/qRdgvxGQ/uYpPX9R6lgmH23DZ4kYpHSQqT36JEvuCLUWwMaMtvk2oJ\nRJcQSdTw7tYbYSITcQMgb+yRS4Qq\n-----END CERTIFICATE-----\n",
-           "private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAqO7yy/GstLwkwOTmIPupKEVbAxMvQW/ga23Ox18RGB4yyUMK\nXRHSz0uFdsFAN/7pPpxj05LUPeoKYh4koB++8pQDQdg79Y6FiB4DmVrclxHwJ5x5\n7lNMtxZm1pDGyRUvU3cJUGdTyDOieQUbSo95z5mMkNgxyx8xo+lSXKfEE4y3L2fA\nVwrWxaQDE126k+wgs4eYyVkT3XigcDC4IcUkl1lfwoDkms1W7rLXkK206HbvX1vG\nM/+uOr3phsJJTaUxTKWiJ/cHU6llXphXuhGXu1dr3525OUB+b9QwIXlaTkLY0rkk\nvQvSaFLvtno7q82eW1iA8UyYxQh+xIZFs4OY/wIDAQABAoIBABd6PdwCFlJ341O7\nfBARaYzjNqbSv7qEZdgIRriGicWkTMKTwpj0pSuR/1ZlvRsLHjdJXMZGnaCNKixA\nrC5kuxDTaTB5cLvLttsX8MAbVJTaNVoL8RYiFYNMZbZkIHxJqW4cGPtHoOkt4+KV\nxxkxn2gums52fVURXMC+6GdgGWvt5J4FcjfYfsuThVCcAAKsLlOfI+PM8heN72so\nRXHBxwPCIaqeCev6nA8IguIj165OVOYGTf+PWLT83AqXGET7YfcIMs745Pd+c1kd\n5yRk+uSS79AEb/t0PgXF9RBTTjBOBKz0HoGY6vDEMpbfb2YthTjPqJAWmLDPlWyX\nyTfZpQECgYEA2HaqvqmXTpApeC1QgWeHRfbjel+t67bHM1Z/HNTzIeI91P2pCdot\n/UHLMvLgDg//9WpFtW13r0x7GcKLr9vLsRW+irZC+0SNMqkBq+ee12nrES0Ikqj5\ne8G1CRKh59KdNQMWAVRv4QRaPfzn3ERxB/kqooD5yo6xVQh9vTsemeECgYEAx8nh\nw5SkBun5VkdD9WqPxisBOTNXkbUjrrpc7lPs2/0kYkYILwRm6PnKPstCo4ZV1RId\nfDRy2gtyyikWBvKz3el9sbg0VHPACgW3CxjTPCu1T0JfL1YIdWnEAXFRliJCrNWS\n2fHJzHdyIqEeK4dgw6BwnOZlq/AtY6FajhoZTt8CgYBMfgqyW42rZogw/ppfUC1e\nTPNv0BXOoQVdn+hFUP8l7yP4ezbb02zC/RgIRgllDsRdfhNqHGfZ24X4wWXJXDtr\ntYpizCt5TW00BMMhczUPXE+D/0zzPqEC2Z3Wue3a1PNWw2NoTuVGN9qH4zIwBUOI\nFMW7LSaYLLp/mQON9jFHIQKBgCgjsF8qCvZ0paqm8Mlq2m33D+zdGtfka8HcIXWk\nmO7t4hR4e4ZuvPpLzU1mawINqEsBs7jTlMuoBy0Eqi9FLcwE8EL3flQFWWzqDweE\nulPZeDjvXc5V26czU7TyfnDKe1jcI//zqxaQXPcGJdia/17uahGr3Ht56rSco2Pv\nbGxDAoGBANNDkTgUCePmJ1C7gZk0FXpKXbhZsRuI6q7y9cdIfVQRV2bzZeuVBway\ntrsFTDVgr1bFa6cB6br5Srecnbg7zFjuhFz8fJ4Jxss9PcWu8SQSyNr5uK9coxNY\nl511hqO1SUxU60iuRqUYXrQSPWMhqCHb9rEFAF3eK+tnVgm7r8A5\n-----END RSA PRIVATE KEY-----\n"
-         }
-       },
-       ".properties.security_acknowledgement": {
-         "value": "X"
-       },
-       ".mysql_monitor.recipient_email": {
-         "value": "micah+cf@young.io"
-       },
-       ".ha_proxy.skip_cert_verify": {
-         "value": true
-       }
-     }' \
-     --product-network '{
-       "singleton_availability_zone": {
-         "name": "nova"
-       },
-       "other_availability_zones": [
-         {
-           "name": "nova"
-         }
-       ],
-       "network": {
-         "name": "private-network"
-       }
-     }' \
-     --product-resources '{
-       "consul_server": {
-         "instances": 1
-       },
-       "nats": {
-         "instances": 1
-       },
-       "etcd_tls_server": {
-         "instances": 1
-       },
-       "nfs_server": {
-         "persistent_disk": { "size_mb": "10240" }
-       },
-       "mysql_proxy": {
-         "instances": 1
-       },
-       "mysql": {
-         "instances": 1,
-         "persistent_disk": { "size_mb": "10240" }
-       },
-       "diego_database": {
-         "instances": 1
-       },
-       "uaa": {
-         "instances": 1
-       },
-       "cloud_controller": {
-         "instances": 1
-       },
-       "router": {
-         "instances": 1
-       },
-       "cloud_controller_worker": {
-         "instances": 1
-       },
-       "diego_brain": {
-         "instances": 1,
-         "persistent_disk": { "size_mb": "10240" }
-       },
-       "diego_cell": {
-         "instances": 1,
-         "instance_type": { "id": "m1.xlarge" }
-       },
-       "loggregator_trafficcontroller": {
-         "instances": 1
-       },
-       "syslog_adapter": {
-         "instances": 1
-       },
-       "doppler": {
-         "instances": 1
-       }
-    }' \
+git_private_key:
+EOF
+
+PATCHED_PIPELINE=$(
+  yaml-patch \
+    < bin/pcf-pipelines/upgrade-tile/pipeline.yml
+)
+
+fly --target c login --concourse-url $CONCOURSE_URL
+
+PIPELINE_NAME=upgrade-tile
+fly --target c set-pipeline \
+  --pipeline $PIPELINE_NAME \
+  --config <(echo "$PATCHED_PIPELINE") \
+  --load-vars-from state/upgrade-tile-params.yml \
+  --non-interactive \
   ;
 
-  bin/om \
-    --target https://$OPSMAN_FQDN \
-    --username $OPSMAN_USERNAME \
-    --password $OPSMAN_PASSWORD \
-    --skip-ssl-validation \
-    --format json \
-    errands \
-      --product-name $PAS_PRODUCT_NAME \
-  | grep name | cut -d'"' -f4 \
-  | while read errand_name; do
-    bin/om \
-      --target https://$OPSMAN_FQDN \
-      --username $OPSMAN_USERNAME \
-      --password $OPSMAN_PASSWORD \
-      --skip-ssl-validation \
-      --format json \
-      set-errand-state \
-        --product-name $PAS_PRODUCT_NAME \
-        --errand-name $errand_name \
-        --post-deploy-state disabled \
-    ;
-    done \
-  ;
-
-  bin/om \
-    --target https://$OPSMAN_FQDN \
-    --username $OPSMAN_USERNAME \
-    --password $OPSMAN_PASSWORD \
-    --skip-ssl-validation \
-    apply-changes \
-  ;
-fi
+fly --target c unpause-pipeline --pipeline $PIPELINE_NAME
